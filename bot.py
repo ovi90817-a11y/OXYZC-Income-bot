@@ -1,4 +1,8 @@
 import os, sqlite3, logging
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+import uvicorn
 from datetime import datetime, date
 from contextlib import closing
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -387,11 +391,11 @@ async def buttons(update, context):
     elif q.data == "help": await q.message.reply_text("Use the menu to access Balance, Tasks, Referrals, Daily Bonus and Withdraw.")
 
 
-def main():
+def build_application():
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN is not set.")
     init_db()
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).updater(None).build()
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("withdraw", withdraw_start)],
@@ -414,8 +418,60 @@ def main():
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CallbackQueryHandler(claim, pattern=r"^claim:"))
     app.add_handler(CallbackQueryHandler(buttons))
-    app.run_polling()
+    return app
+
+
+telegram_app = build_application()
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+
+
+@asynccontextmanager
+async def lifespan(fastapi_app: FastAPI):
+    await telegram_app.initialize()
+    await telegram_app.start()
+
+    external_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+    webhook_url = os.getenv("WEBHOOK_URL", "").rstrip("/") or (f"{external_url}/webhook" if external_url else "")
+    if not webhook_url:
+        raise RuntimeError("WEBHOOK_URL or RENDER_EXTERNAL_URL is required.")
+
+    if WEBHOOK_SECRET:
+        await telegram_app.bot.set_webhook(url=webhook_url, secret_token=WEBHOOK_SECRET)
+    else:
+        await telegram_app.bot.set_webhook(url=webhook_url)
+
+    logging.info("Telegram webhook set: %s", webhook_url)
+    yield
+    await telegram_app.stop()
+    await telegram_app.shutdown()
+
+
+web_app = FastAPI(title="OXYZC Telegram Bot", lifespan=lifespan)
+
+
+@web_app.get("/")
+async def root():
+    return {"status": "ok", "bot": "OXYZC"}
+
+
+@web_app.get("/health")
+async def health():
+    return {"status": "healthy"}
+
+
+@web_app.post("/webhook")
+async def telegram_webhook(request: Request):
+    if WEBHOOK_SECRET:
+        supplied = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if supplied != WEBHOOK_SECRET:
+            raise HTTPException(status_code=403, detail="Forbidden")
+
+    data = await request.json()
+    update = Update.de_json(data, telegram_app.bot)
+    await telegram_app.process_update(update)
+    return JSONResponse({"ok": True})
 
 
 if __name__ == "__main__":
-    main()
+    port = int(os.getenv("PORT", "10000"))
+    uvicorn.run(web_app, host="0.0.0.0", port=port)
